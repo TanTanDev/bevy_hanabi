@@ -711,24 +711,20 @@ impl EffectSorter {
     }
 }
 
-/// Single effect batch to drive rendering.
+/// A single effect instance to drive rendering, independently of compute batching.
 ///
-/// This component is spawned into the render world during the prepare phase
-/// ([`prepare_effects()`]), once per effect batch per group. In turns it
-/// references an [`EffectBatch`] component containing all the shared data for
-/// all the groups of the effect.
+/// Instances in a shared compute batch can have different positions and
+/// visibility. Each needs its own phase item so transparent draws can be sorted
+/// correctly against other effects and scene meshes.
 #[derive(Debug, Component)]
 pub(crate) struct EffectDrawBatch {
-    /// Index of the [`EffectBatch`] in the [`SortedEffectBatches`] this draw
-    /// batch is part of.
-    ///
-    /// Note: currently there's a 1:1 mapping between effect batch and draw
-    /// batch.
+    /// Index of the shared compute [`EffectBatch`] in the [`Batcher`].
     pub effect_batch_index: EffectBatchIndex,
+    /// Index of this instance in [`EffectBatch::effect_data`].
+    pub effect_data_index: usize,
     /// Position of the emitter so we can compute distance to camera.
     pub translation: Vec3,
     /// The main-world entity that contains this effect.
-    #[allow(dead_code)]
     pub main_entity: MainEntity,
 }
 

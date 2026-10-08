@@ -95,7 +95,7 @@ mod shader_contract_tests;
 mod sort;
 
 use aligned_buffer_vec::AlignedBufferVec;
-use batch::BatchSpawnInfo;
+use batch::{BatchSpawnInfo, EffectBatchIndex};
 pub(crate) use batch::Batcher;
 use buffer_table::{BufferTable, BufferTableId};
 pub(crate) use effect_cache::EffectCache;
@@ -4782,19 +4782,21 @@ pub(crate) fn batch_effects(
                 new_effect_batch_index,
                 entity,
             );
-
-            // Spawn an EffectDrawBatch to drive rendering for that batch. Note that
-            // technically nothing imposes we use the same batching for compute init/update
-            // and for rendering, so we could (and probably should) re-batch specifically
-            // for rendering. For now we just use the same batches.
-            commands
-                .spawn(EffectDrawBatch {
-                    effect_batch_index: new_effect_batch_index,
-                    translation,
-                    main_entity: *main_entity,
-                })
-                .insert(TemporaryRenderEntity);
         }
+        // push() either starts a batch or appends this instance to the last one.
+        // Keep compute dispatches batched, but queue every instance separately:
+        // one representative emitter position cannot depth-sort an entire batch.
+        let effect_batch_index = new_effect_batch_index
+            .unwrap_or_else(|| EffectBatchIndex((batcher.len() - 1) as u32));
+        let effect_data_index = batcher.last().unwrap().effect_data.len() - 1;
+        commands
+            .spawn(EffectDrawBatch {
+                effect_batch_index,
+                effect_data_index,
+                translation,
+                main_entity: *main_entity,
+            })
+            .insert(TemporaryRenderEntity);
         if let Some((sort_fill_indirect_dispatch_index, sort_indirect_dispatch_index)) =
             sort_indirect_dispatch_indices
         {
@@ -5420,27 +5422,18 @@ fn emit_sorted_draw<T, F>(
                 continue;
             }
 
-            // Check if batch contains any entity visible in the current view. Otherwise we
-            // can skip the entire batch. Note: This is O(n^2) but (unlike
-            // the Sprite renderer this is inspired from) we don't expect more than
-            // a handful of particle effect instances, so would rather not pay the memory
-            // cost of a FixedBitSet for the sake of an arguable speed-up.
-            // TODO - Profile to confirm.
+            // Visibility belongs to this draw instance, not to any other emitter
+            // which happens to share its compute batch.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .effect_data
-                .iter()
-                .any(|effect_data| view_entities.contains(effect_data.entity as usize));
+            let has_visible_entity =
+                view_entities.contains(draw_batch.main_entity.id().index_u32() as usize);
             if !has_visible_entity {
                 trace!("No visible entity for view, not emitting any draw call.");
                 continue;
             }
             #[cfg(feature = "trace")]
             _span_check_vis.exit();
-
-            // FIXME - We draw the entire batch, but part of it may not be visible in this
-            // view! We should re-batch for the current view specifically!
 
             let local_space_simulation = effect_batch
                 .layout_flags
@@ -5628,27 +5621,17 @@ fn emit_binned_draw<T, F, G>(
                 continue;
             }
 
-            // Check if batch contains any entity visible in the current view. Otherwise we
-            // can skip the entire batch. Note: This is O(n^2) but (unlike
-            // the Sprite renderer this is inspired from) we don't expect more than
-            // a handful of particle effect instances, so would rather not pay the memory
-            // cost of a FixedBitSet for the sake of an arguable speed-up.
-            // TODO - Profile to confirm.
+            // Only queue the instance represented by this draw item.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .effect_data
-                .iter()
-                .any(|effect_data| view_entities.contains(effect_data.entity as usize));
+            let has_visible_entity =
+                view_entities.contains(draw_batch.main_entity.id().index_u32() as usize);
             if !has_visible_entity {
                 trace!("No visible entity for view, not emitting any draw call.");
                 continue;
             }
             #[cfg(feature = "trace")]
             _span_check_vis.exit();
-
-            // FIXME - We draw the entire batch, but part of it may not be visible in this
-            // view! We should re-batch for the current view specifically!
 
             let local_space_simulation = effect_batch
                 .layout_flags
@@ -6781,7 +6764,15 @@ fn draw<'w>(
         trace!("Effect draw batch no longer exists. Skipping draw call.");
         return;
     };
-    let effect_batch = batcher.get(effect_draw_batch.effect_batch_index).unwrap();
+    let Some(effect_batch) = batcher.get(effect_draw_batch.effect_batch_index) else {
+        return;
+    };
+    let Some(effect_data) = effect_batch
+        .effect_data
+        .get(effect_draw_batch.effect_data_index)
+    else {
+        return;
+    };
 
     let Some(pipeline) = pipeline_cache.into_inner().get_render_pipeline(pipeline_id) else {
         trace!("ERROR: Failed to find render pipeline ID {:?}", pipeline_id);
@@ -6833,6 +6824,18 @@ fn draw<'w>(
     let spawner_size = effects_meta.spawner_buffer.aligned_size() as u32;
     assert!(spawner_size >= GpuSpawnerParams::min_size().get() as u32);
 
+    // Each phase item draws only its own instance. Drawing the whole compute
+    // batch here would repeat every instance and bypass the phase's depth order.
+    let with_prefix_sum = false;
+    pass.set_bind_group(
+        2,
+        property_bind_groups
+            .get(&effect_batch.property_key, with_prefix_sum)
+            .unwrap(),
+        &[effect_data.render_batch_info_offset],
+    );
+    let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
+
     match render_mesh.buffer_info {
         RenderMeshBufferInfo::Indexed { index_format, .. } => {
             let Some(index_buffer_slice) = mesh_allocator.mesh_index_slice(&effect_batch.mesh)
@@ -6845,71 +6848,23 @@ fn draw<'w>(
             };
 
             pass.set_index_buffer(index_buffer_slice.buffer.slice(..), index_format);
-            // Note: multi_draw_indexed_indirect() only works if first_instance is
-            // available, which doesn't work without validation in wgpu. This is due to a
-            // limitation in DX12. We could have multidraw in Vulkan only though, but that
-            // requires dynamically switching.
-            // pass.multi_draw_indexed_indirect(
-            //     indirect_buffer,
-            //     draw_indirect_offset,
-            //     effect_batch.effect_count,
-            // );
-            let with_prefix_sum = false; // per-effect, no draw batching
+            assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
+            let draw_indirect_offset =
+                draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
             trace!(
-                "Emit non-batched draw_indexed_indirect() for {} effect instances...",
-                effect_batch.effect_data.len()
+                "+ batch-info @+{}B (row #{}), draw_indirect_offset=+{}B (row #{})",
+                effect_data.render_batch_info_offset,
+                effect_data.render_batch_info_offset / GpuBatchInfo::SHADER_SIZE.get() as u32,
+                draw_indirect_offset,
+                draw_indirect_index,
             );
-            for effect_data in &effect_batch.effect_data {
-                pass.set_bind_group(
-                    2,
-                    property_bind_groups
-                        .get(&effect_batch.property_key, with_prefix_sum)
-                        .unwrap(),
-                    &[effect_data.render_batch_info_offset],
-                );
-                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
-                assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
-                let draw_indirect_offset =
-                    draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
-                trace!(
-                    "+ batch-info @+{}B (row #{}), draw_indirect_offset=+{}B (row #{})",
-                    effect_data.render_batch_info_offset,
-                    effect_data.render_batch_info_offset / GpuBatchInfo::SHADER_SIZE.get() as u32,
-                    draw_indirect_offset,
-                    draw_indirect_index,
-                );
-                pass.draw_indexed_indirect(indirect_buffer, draw_indirect_offset);
-            }
+            pass.draw_indexed_indirect(indirect_buffer, draw_indirect_offset);
         }
         RenderMeshBufferInfo::NonIndexed => {
-            // Note: multi_draw_indexed_indirect() only works if first_instance is
-            // available, which doesn't work without validation in wgpu. This is due to a
-            // limitation in DX12. We could have multidraw in Vulkan only though, but that
-            // requires dynamically switching.
-            // pass.multi_draw_indirect(
-            //     indirect_buffer,
-            //     draw_indirect_offset,
-            //     effect_batch.effect_count,
-            // );
-            let with_prefix_sum = false; // per-effect, no draw batching
-            trace!(
-                "Emit non-batched draw_indirect() for {} effect instances...",
-                effect_batch.effect_data.len()
-            );
-            for effect_data in &effect_batch.effect_data {
-                pass.set_bind_group(
-                    2,
-                    property_bind_groups
-                        .get(&effect_batch.property_key, with_prefix_sum)
-                        .unwrap(),
-                    &[effect_data.render_batch_info_offset],
-                );
-                let draw_indirect_index = effect_data.draw_indirect_buffer_row_index.0;
-                assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
-                let draw_indirect_offset =
-                    draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
-                pass.draw_indirect(indirect_buffer, draw_indirect_offset);
-            }
+            assert_eq!(GpuDrawIndexedIndirectArgs::SHADER_SIZE.get(), 20);
+            let draw_indirect_offset =
+                draw_indirect_index as u64 * GpuDrawIndexedIndirectArgs::SHADER_SIZE.get();
+            pass.draw_indirect(indirect_buffer, draw_indirect_offset);
         }
     }
 }
