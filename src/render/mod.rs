@@ -4726,9 +4726,9 @@ pub(crate) fn batch_effects(
 
         let texture_layout = extracted_effect.texture_layout.clone();
         let property_key = if let Some(cp) = cached_properties.as_ref() {
-            PropertyBindGroupKey::new(cp, texture_layout)
+            PropertyBindGroupKey::new(cp, texture_layout, &extracted_effect.textures)
         } else {
-            PropertyBindGroupKey::texture_only(texture_layout)
+            PropertyBindGroupKey::texture_only(texture_layout, &extracted_effect.textures)
         };
 
         // Create a single-effect batch candidate. It can be merged with the previous
@@ -6579,8 +6579,6 @@ pub(crate) fn prepare_bind_groups(
             &property_cache,
             &spawner_buffer,
             &prefix_sum_buffer,
-            &effect_batch.texture_layout,
-            &effect_batch.textures[..],
             &batch_info_buffer,
             &render_device,
             &pipeline_cache,

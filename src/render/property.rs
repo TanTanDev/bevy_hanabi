@@ -4,7 +4,7 @@ use std::{
 };
 
 use bevy::{
-    asset::Handle,
+    asset::{AssetId, Handle},
     ecs::{lifecycle::Remove, observer::On, query::Without, system::Commands, world::Mut},
     image::Image,
     log::{error, trace},
@@ -800,6 +800,9 @@ pub struct PropertyBindGroupKey {
     pub binding_size: u32,
     /// Texture layout for the material binding points.
     pub texture_layout: TextureLayout,
+    /// Bound images in texture-slot order. Identical layouts can bind different
+    /// images, and swapping two slots must also select a different bind group.
+    pub textures: Vec<AssetId<Image>>,
 }
 
 // Note: use by HashMap to turn a key reference into an owned key when inserting
@@ -812,20 +815,26 @@ impl From<&PropertyBindGroupKey> for PropertyBindGroupKey {
 }
 
 impl PropertyBindGroupKey {
-    pub fn new(properties: &CachedEffectProperties, texture_layout: TextureLayout) -> Self {
+    pub fn new(
+        properties: &CachedEffectProperties,
+        texture_layout: TextureLayout,
+        textures: &[Handle<Image>],
+    ) -> Self {
         Self {
             buffer_index: properties.buffer_index,
             binding_size: properties.property_layout.min_binding_size().get() as u32,
             texture_layout,
+            textures: textures.iter().map(|image| image.id()).collect(),
         }
     }
 
     /// Get a key for an effect without property.
-    pub fn texture_only(texture_layout: TextureLayout) -> Self {
+    pub fn texture_only(texture_layout: TextureLayout, textures: &[Handle<Image>]) -> Self {
         Self {
             buffer_index: 0,
             binding_size: 0,
             texture_layout,
+            textures: textures.iter().map(|image| image.id()).collect(),
         }
     }
 
@@ -841,8 +850,8 @@ impl PropertyBindGroupKey {
 
 #[derive(Default, Resource)]
 pub struct PropertyBindGroups {
-    /// Map from a [`PropertyBuffer`] index and a binding size to the
-    /// corresponding bind group.
+    /// Map from a [`PropertyBuffer`] index, binding size, texture layout and
+    /// ordered image identities to the corresponding bind groups.
     property_bind_groups: HashMap<PropertyBindGroupKey, [BindGroup; 2]>,
 }
 
@@ -856,8 +865,6 @@ impl PropertyBindGroups {
         property_key: &PropertyBindGroupKey,
         property_cache: &PropertyCache,
         with_prefix_sum: bool,
-        texture_layout: &TextureLayout,
-        textures: &[Handle<Image>],
         spawner_buffer: &Buffer,
         prefix_sum_buffer: &Buffer,
         batch_info_buffer: &Buffer,
@@ -882,7 +889,7 @@ impl PropertyBindGroups {
         let Some(layout_desc) = property_cache.bind_group_layout_desc(
             property_binding_size,
             with_prefix_sum,
-            texture_layout,
+            &property_key.texture_layout,
         ) else {
             error!(
                 "Missing property bind group layout for binding size {:?}, referenced by effect batch.",
@@ -925,10 +932,11 @@ impl PropertyBindGroups {
                 resource: property_buffer.as_entire_binding(),
             });
         }
-        // TODO = move
+        // Use the key itself to select the images so cache identity and actual
+        // bindings cannot disagree.
         let material = Material {
-            layout: texture_layout.clone(),
-            textures: textures.iter().map(|h| h.id()).collect(),
+            layout: property_key.texture_layout.clone(),
+            textures: property_key.textures.clone(),
         };
         assert_eq!(material.layout.layout.len(), material.textures.len());
         material.append_binding_entries(4, gpu_images, &mut entries);
@@ -971,8 +979,6 @@ impl PropertyBindGroups {
         property_cache: &PropertyCache,
         spawner_buffer: &Buffer,
         prefix_sum_buffer: &Buffer,
-        texture_layout: &TextureLayout,
-        textures: &[Handle<Image>],
         batch_info_buffer: &Buffer,
         render_device: &RenderDevice,
         pipeline_cache: &PipelineCache,
@@ -999,8 +1005,6 @@ impl PropertyBindGroups {
                     property_key,
                     property_cache,
                     false,
-                    texture_layout,
-                    textures,
                     spawner_buffer,
                     prefix_sum_buffer,
                     batch_info_buffer,
@@ -1013,8 +1017,6 @@ impl PropertyBindGroups {
                     property_key,
                     property_cache,
                     true,
-                    texture_layout,
-                    textures,
                     spawner_buffer,
                     prefix_sum_buffer,
                     batch_info_buffer,
